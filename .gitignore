@@ -1,0 +1,8 @@
+# Compiled Binaries
+server
+server.exe
+*.o
+*.out
+
+# IDE configs
+.vscode/
