@@ -8,8 +8,291 @@
 #include <vector>
 #include <poll.h>
 #include <fcntl.h>
+#include <unordered_map>
 
 using namespace std;
+
+// Represents a connected client and their read buffer
+struct Client {
+    int fd;
+    string read_buffer;
+};
+
+// --- DATABASE IN-MEMORY STORAGE STRUCTURES ---
+
+// A single key-value node in our hash table
+struct Entry {
+    string key;
+    string value;
+    Entry* next; // Pointer to next entry if they hash to the same bucket (chaining)
+};
+
+// A single hash table
+struct HashTable {
+    Entry** table = nullptr; // Array of Entry pointers
+    size_t size = 0;         // Size of the array
+    size_t mask = 0;         // Size - 1 (used for fast bitwise modulo: hash & mask)
+    size_t num_keys = 0;     // Number of keys stored in this table
+};
+
+// The main database containing two hash tables for incremental rehashing
+struct RedisDb {
+    HashTable ht[2];
+    int rehash_idx = -1; // If -1, we are not rehashing. If >= 0, it tracks our rehashing progress.
+};
+
+// Standard FNV-1a 32-bit Hash Function (simple and highly efficient for strings)
+uint32_t hash_function(const string& key) {
+    uint32_t hash = 2166136261U;
+    for (char c : key) {
+        hash ^= (uint8_t)c;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+// Moves a single bucket of keys from ht[0] to ht[1]
+void db_rehash_step(RedisDb& db) {
+    if (db.rehash_idx == -1) return; // If not rehashing, do nothing
+
+    // 1. Skip empty buckets in ht[0] until we find one with keys
+    while (db.ht[0].table[db.rehash_idx] == nullptr) {
+        db.rehash_idx++;
+        // If we reach the end, ht[0] is completely empty!
+        if (db.rehash_idx >= (int)db.ht[0].size) {
+            free(db.ht[0].table);
+            db.ht[0] = db.ht[1];          // Make ht[1] the primary table
+            db.ht[1] = HashTable{};       // Reset ht[1] to empty
+            db.rehash_idx = -1;           // Mark rehashing as complete
+            return;
+        }
+    }
+
+    // 2. Move all keys in this specific bucket from ht[0] to ht[1]
+    Entry* curr = db.ht[0].table[db.rehash_idx];
+    while (curr != nullptr) {
+        Entry* next = curr->next;
+
+        // Calculate its new bucket index in ht[1]
+        uint32_t h = hash_function(curr->key) & db.ht[1].mask;
+
+        // Insert it at the start of the list in ht[1]
+        curr->next = db.ht[1].table[h];
+        db.ht[1].table[h] = curr;
+
+        // Update counts
+        db.ht[0].num_keys--;
+        db.ht[1].num_keys++;
+
+        curr = next;
+    }
+
+    // 3. Clear the old bucket we just migrated in ht[0]
+    db.ht[0].table[db.rehash_idx] = nullptr;
+    db.rehash_idx++; // Move pointer to next bucket
+
+    // 4. Double check if ht[0] is now completely empty
+    if (db.ht[0].num_keys == 0) {
+        free(db.ht[0].table);
+        db.ht[0] = db.ht[1];
+        db.ht[1] = HashTable{};
+        db.rehash_idx = -1;
+    }
+}
+
+// Prepares the database to resize by allocating the secondary table ht[1]
+void db_resize(RedisDb& db) {
+    if (db.rehash_idx != -1) return; // Already rehashing
+
+    // Double the size of the current table (or start at size 4 if empty)
+    size_t new_size = (db.ht[0].size == 0) ? 4 : db.ht[0].size * 2;
+
+    // Allocate memory for the new table buckets
+    db.ht[1].table = (Entry**)calloc(new_size, sizeof(Entry*));
+    db.ht[1].size = new_size;
+    db.ht[1].mask = new_size - 1;
+    db.ht[1].num_keys = 0;
+
+    // Point the pointer to bucket 0 to start rehashing
+    db.rehash_idx = 0;
+}
+
+// Helper: Searches for a key in a single HashTable
+Entry* ht_find(HashTable& ht, const string& key) {
+    if (ht.size == 0) return nullptr;
+    uint32_t h = hash_function(key) & ht.mask;
+    Entry* curr = ht.table[h];
+    while (curr != nullptr) {
+        if (curr->key == key) return curr;
+        curr = curr->next;
+    }
+    return nullptr;
+}
+
+// Gets the value of a key from our database. Returns empty string if not found.
+string db_get(RedisDb& db, const string& key) {
+    // Perform one step of migration if active
+    if (db.rehash_idx != -1) db_rehash_step(db);
+
+    // Search in the primary table ht[0] first
+    Entry* entry = ht_find(db.ht[0], key);
+    if (entry != nullptr) return entry->value;
+
+    // If not found and we are rehashing, check the secondary table ht[1]
+    if (db.rehash_idx != -1) {
+        entry = ht_find(db.ht[1], key);
+        if (entry != nullptr) return entry->value;
+    }
+    return ""; // Not found
+}
+
+// Sets a key to a value in our database
+void db_set(RedisDb& db, const string& key, const string& value) {
+    // Perform one step of migration if active
+    if (db.rehash_idx != -1) db_rehash_step(db);
+
+    // If the table is empty or too full (num_keys >= size), trigger resize
+    if (db.ht[0].size == 0 || db.ht[0].num_keys >= db.ht[0].size) {
+        db_resize(db);
+    }
+
+    // Check if key already exists (search both tables)
+    Entry* entry = ht_find(db.ht[0], key);
+    if (entry == nullptr && db.rehash_idx != -1) {
+        entry = ht_find(db.ht[1], key);
+    }
+
+    if (entry != nullptr) {
+        entry->value = value; // Update existing value
+        return;
+    }
+
+    // Create a new entry node
+    Entry* new_entry = new Entry{key, value, nullptr};
+
+    // If rehashing is active, insert the new key directly into the new table ht[1]
+    if (db.rehash_idx != -1) {
+        uint32_t h = hash_function(key) & db.ht[1].mask;
+        new_entry->next = db.ht[1].table[h];
+        db.ht[1].table[h] = new_entry;
+        db.ht[1].num_keys++;
+    } else {
+        // Otherwise, insert into ht[0]
+        uint32_t h = hash_function(key) & db.ht[0].mask;
+        new_entry->next = db.ht[0].table[h];
+        db.ht[0].table[h] = new_entry;
+        db.ht[0].num_keys++;
+    }
+}
+
+// Helper: Deletes a key from a single HashTable
+bool ht_delete(HashTable& ht, const string& key) {
+    if (ht.size == 0) return false;
+    uint32_t h = hash_function(key) & ht.mask;
+    Entry* curr = ht.table[h];
+    Entry* prev = nullptr;
+    while (curr != nullptr) {
+        if (curr->key == key) {
+            // Remove node from linked list
+            if (prev == nullptr) {
+                ht.table[h] = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+            delete curr; // Free memory
+            ht.num_keys--;
+            return true;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    return false;
+}
+
+// Deletes a key from our database
+bool db_del(RedisDb& db, const string& key) {
+    // Perform one step of migration if active
+    if (db.rehash_idx != -1) db_rehash_step(db);
+
+    // Try deleting from primary table ht[0] first
+    bool deleted = ht_delete(db.ht[0], key);
+    
+    // If not found in ht[0] and we are rehashing, try deleting from ht[1]
+    if (!deleted && db.rehash_idx != -1) {
+        deleted = ht_delete(db.ht[1], key);
+    }
+    return deleted;
+}
+
+// Helper: reads a single line ending in \r\n from 'buf' starting at 'pos'.
+// If a line is successfully read, updates 'pos' and returns the line content (without \r\n).
+// If a complete line is not found, returns an empty string and leaves 'pos' unchanged.
+string read_line(const string& buf, size_t& pos) {
+    size_t newline = buf.find("\r\n", pos);
+    if (newline == string::npos) {
+        return ""; // Incomplete line
+    }
+    string line = buf.substr(pos, newline - pos);
+    pos = newline + 2; // Advance pos past \r\n
+    return line;
+}
+
+// Attempts to parse a complete RESP command array from the buffer.
+// Returns 1 if a full command is parsed (and removes it from buf).
+// Returns 0 if the data is incomplete (needs more bytes).
+// Returns -1 if there is a protocol error.
+int parse_request(string& buf, vector<string>& cmd) {
+    if (buf.empty()) return 0;
+    
+    size_t pos = 0;
+    
+    // 1. Read the array header line, e.g. "*3"
+    string array_line = read_line(buf, pos);
+    if (array_line.empty()) return 0; // Incomplete
+    
+    if (array_line[0] != '*') return -1; // Protocol error: must start with '*'
+    
+    // Parse how many words are in this command
+    int num_elements = stoi(array_line.substr(1));
+    if (num_elements <= 0) {
+        buf.erase(0, pos);
+        return 1;
+    }
+    
+    vector<string> parsed_cmd;
+    
+    // 2. Loop to read each word
+    for (int i = 0; i < num_elements; ++i) {
+        // Read the string length line, e.g. "$4"
+        string len_line = read_line(buf, pos);
+        if (len_line.empty()) return 0; // Incomplete
+        
+        if (len_line[0] != '$') return -1; // Protocol error: must start with '$'
+        
+        int str_len = stoi(len_line.substr(1));
+        
+        // Check if we have the entire word content + trailing "\r\n" in the buffer
+        if (pos + str_len + 2 > buf.size()) {
+            return 0; // Incomplete
+        }
+        
+        // Extract the actual word content
+        string content = buf.substr(pos, str_len);
+        
+        // Verify it ends with "\r\n"
+        if (buf.substr(pos + str_len, 2) != "\r\n") {
+            return -1; // Protocol error
+        }
+        
+        parsed_cmd.push_back(content);
+        pos += str_len + 2; // Advance past the word and "\r\n"
+    }
+    
+    // Success: remove parsed data from buffer and save the command
+    buf.erase(0, pos);
+    cmd = parsed_cmd;
+    return 1;
+}
 
 // Helper function to handle errors cleanly
 void die(const string& message) {
@@ -27,6 +310,57 @@ void set_nonblocking(int fd) {
     // 2. Add the O_NONBLOCK flag to make it non-blocking
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         die("fcntl F_SETFL O_NONBLOCK");
+    }
+}
+
+// Our global in-memory database instance
+RedisDb g_db;
+
+// Executes a successfully parsed command list and sends back a RESP response
+void execute_command(int fd, const vector<string>& cmd) {
+    if (cmd.empty()) return;
+
+    string response;
+    string command_name = cmd[0];
+    
+    // Convert command name to uppercase for case insensitivity
+    for (char &c : command_name) {
+        c = toupper(c);
+    }
+
+    if (command_name == "PING") {
+        response = "+PONG\r\n"; // Simple String response
+    } 
+    else if (command_name == "ECHO" && cmd.size() > 1) {
+        // Bulk String response: $<len>\r\n<msg>\r\n
+        response = "$" + to_string(cmd[1].length()) + "\r\n" + cmd[1] + "\r\n";
+    } 
+    else if (command_name == "SET" && cmd.size() > 2) {
+        db_set(g_db, cmd[1], cmd[2]);
+        response = "+OK\r\n"; // Simple String OK response
+    } 
+    else if (command_name == "GET" && cmd.size() > 1) {
+        string value = db_get(g_db, cmd[1]);
+        if (value.empty()) {
+            response = "$-1\r\n"; // Null Bulk String (key not found)
+        } else {
+            response = "$" + to_string(value.length()) + "\r\n" + value + "\r\n";
+        }
+    } 
+    else if (command_name == "DEL" && cmd.size() > 1) {
+        bool deleted = db_del(g_db, cmd[1]);
+        if (deleted) {
+            response = ":1\r\n"; // Integer 1 (deleted successfully)
+        } else {
+            response = ":0\r\n"; // Integer 0 (key not found)
+        }
+    }
+    else {
+        response = "-ERR unknown command '" + cmd[0] + "'\r\n"; // Error response
+    }
+
+    if (write(fd, response.data(), response.length()) < 0) {
+        cerr << "Write failed on Client FD = " << fd << ": " << strerror(errno) << "\n";
     }
 }
 
@@ -82,6 +416,9 @@ int main() {
     server_pfd.events = POLLIN; // Monitor for incoming connection events
     fds.push_back(server_pfd);
 
+    // Map to associate each client's file descriptor with their Client state
+    unordered_map<int, Client> clients;
+
     // ==========================================
     // STEP 5: THE EVENT LOOP
     // ==========================================
@@ -111,6 +448,10 @@ int main() {
                 client_pfd.fd = client_fd;
                 client_pfd.events = POLLIN; // Monitor for readable messages
                 fds.push_back(client_pfd);
+
+                // Register client in our state map
+                clients[client_fd] = Client{client_fd, ""};
+
                 cout << "Client connected! Client FD = " << client_fd << "\n";
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 cerr << "Accept failed: " << strerror(errno) << "\n";
@@ -123,34 +464,53 @@ int main() {
         // We start at index 1 because index 0 is our main server socket
         for (size_t i = 1; i < fds.size(); ) {
             bool socket_closed = false;
+            int client_fd = fds[i].fd;
 
             // Check if this client socket is active (light is on)
             if (fds[i].revents & POLLIN) {
                 char buffer[1024];
-                int bytes_read = read(fds[i].fd, buffer, sizeof(buffer) - 1);
+                int bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
                 
                 if (bytes_read < 0) {
-                    // Check if it's a real error (not just "no data right now")
                     if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        cerr << "Read failed on Client FD = " << fds[i].fd << ": " << strerror(errno) << "\n";
-                        close(fds[i].fd);
+                        cerr << "Read failed on Client FD = " << client_fd << ": " << strerror(errno) << "\n";
+                        close(client_fd);
+                        clients.erase(client_fd); // Remove client state
                         fds.erase(fds.begin() + i); // Remove from watch list
                         socket_closed = true;
                     }
                 } 
                 else if (bytes_read == 0) {
-                    // Client closed the connection
-                    cout << "Client disconnected. Client FD = " << fds[i].fd << "\n";
-                    close(fds[i].fd);
+                    cout << "Client disconnected. Client FD = " << client_fd << "\n";
+                    close(client_fd);
+                    clients.erase(client_fd); // Remove client state
                     fds.erase(fds.begin() + i); // Remove from watch list
                     socket_closed = true;
                 } 
                 else {
-                    // We received actual data! Null-terminate and echo it back.
-                    buffer[bytes_read] = '\0';
-                    cout << "Received: " << buffer;
-                    if (write(fds[i].fd, buffer, bytes_read) < 0) {
-                        cerr << "Write failed on Client FD = " << fds[i].fd << ": " << strerror(errno) << "\n";
+                    // Append incoming bytes to this client's read buffer
+                    clients[client_fd].read_buffer.append(buffer, bytes_read);
+
+                    // Parse and execute as many complete commands as we can find
+                    vector<string> cmd;
+                    while (true) {
+                        int parse_res = parse_request(clients[client_fd].read_buffer, cmd);
+                        if (parse_res == 0) {
+                            // Message is incomplete, wait for more packets
+                            break;
+                        }
+                        if (parse_res < 0) {
+                            // Protocol error (not standard RESP)
+                            cerr << "Protocol error on Client FD = " << client_fd << "\n";
+                            close(client_fd);
+                            clients.erase(client_fd);
+                            fds.erase(fds.begin() + i);
+                            socket_closed = true;
+                            break;
+                        }
+                        
+                        // Successfully parsed a complete command! Execute it.
+                        execute_command(client_fd, cmd);
                     }
                 }
             }
