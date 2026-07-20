@@ -190,6 +190,35 @@ int64_t db_ttl(RedisDb& db, const string& key) {
     return (int64_t)((entry->expire_at - now) / 1000); // Remaining seconds
 }
 
+// Samples random keys and deletes expired ones periodically (Active Expiration Sweep)
+void active_expire_step(RedisDb& db) {
+    if (db.ht[0].size == 0 || db.ht[0].num_keys == 0) return;
+
+    int samples = 0;
+    int max_samples = 20; // Sample up to 20 keys per check
+    uint64_t now = current_time_ms();
+
+    // Start at a random bucket index
+    size_t start_bucket = rand() % db.ht[0].size;
+
+    for (size_t i = 0; i < db.ht[0].size && samples < max_samples; ++i) {
+        size_t idx = (start_bucket + i) % db.ht[0].size;
+        Entry* curr = db.ht[0].table[idx];
+
+        while (curr != nullptr && samples < max_samples) {
+            Entry* next = curr->next;
+            samples++;
+
+            if (curr->expire_at > 0 && now >= curr->expire_at) {
+                // Key is expired! Delete it from DB
+                string key_to_del = curr->key;
+                db_del(db, key_to_del);
+            }
+            curr = next;
+        }
+    }
+}
+
 // Gets the value of a key from our database. Returns empty string if not found.
 string db_get(RedisDb& db, const string& key) {
     // Passive Expiration check: if key is expired, delete it lazily
@@ -512,8 +541,8 @@ int main() {
     // STEP 5: THE EVENT LOOP
     // ==========================================
     while (true) {
-        // poll() blocks the program until there is active network traffic
-        int num_events = poll(fds.data(), fds.size(), -1);
+        // poll() blocks for up to 100ms waiting for active network traffic
+        int num_events = poll(fds.data(), fds.size(), 100);
         if (num_events < 0) {
             if (errno == EINTR) continue; // If interrupted, try again
             die("poll");
@@ -609,6 +638,9 @@ int main() {
                 i++;
             }
         }
+
+        // Active Expiration Sweep: sample random keys and delete expired ones
+        active_expire_step(g_db);
     }
 
     close(server_fd);
