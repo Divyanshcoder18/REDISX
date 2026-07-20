@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <unordered_map>
+#include <chrono>
 
 using namespace std;
 
@@ -24,8 +25,15 @@ struct Client {
 struct Entry {
     string key;
     string value;
-    Entry* next; // Pointer to next entry if they hash to the same bucket (chaining)
+    uint64_t expire_at = 0; // Expiration timestamp in ms (0 means no expiration)
+    Entry* next;            // Pointer to next entry if they hash to the same bucket (chaining)
 };
+
+// Returns current Unix timestamp in milliseconds
+uint64_t current_time_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
 
 // A single hash table
 struct HashTable {
@@ -129,8 +137,64 @@ Entry* ht_find(HashTable& ht, const string& key) {
     return nullptr;
 }
 
+// Forward declaration of db_del for passive_expire
+bool db_del(RedisDb& db, const string& key);
+
+// Checks if a key is expired. If expired, deletes it lazily (Passive Expiration).
+bool passive_expire(RedisDb& db, const string& key) {
+    Entry* entry = ht_find(db.ht[0], key);
+    if (entry == nullptr && db.rehash_idx != -1) {
+        entry = ht_find(db.ht[1], key);
+    }
+    if (entry != nullptr && entry->expire_at > 0) {
+        if (current_time_ms() >= entry->expire_at) {
+            db_del(db, key); // Expired! Delete lazily on the spot
+            return true;
+        }
+    }
+    return false;
+}
+
+// Sets an expiration time in seconds for a key
+bool db_expire(RedisDb& db, const string& key, uint64_t seconds) {
+    if (passive_expire(db, key)) return false; // Key already expired
+
+    Entry* entry = ht_find(db.ht[0], key);
+    if (entry == nullptr && db.rehash_idx != -1) {
+        entry = ht_find(db.ht[1], key);
+    }
+    if (entry == nullptr) return false; // Key does not exist
+
+    entry->expire_at = current_time_ms() + (seconds * 1000);
+    return true;
+}
+
+// Returns remaining TTL in seconds (-2 if non-existent, -1 if no expiration, >=0 if active)
+int64_t db_ttl(RedisDb& db, const string& key) {
+    if (passive_expire(db, key)) return -2; // Key expired/deleted
+
+    Entry* entry = ht_find(db.ht[0], key);
+    if (entry == nullptr && db.rehash_idx != -1) {
+        entry = ht_find(db.ht[1], key);
+    }
+    if (entry == nullptr) return -2; // Key does not exist
+
+    if (entry->expire_at == 0) return -1; // No expiration set
+
+    uint64_t now = current_time_ms();
+    if (now >= entry->expire_at) {
+        db_del(db, key);
+        return -2;
+    }
+
+    return (int64_t)((entry->expire_at - now) / 1000); // Remaining seconds
+}
+
 // Gets the value of a key from our database. Returns empty string if not found.
 string db_get(RedisDb& db, const string& key) {
+    // Passive Expiration check: if key is expired, delete it lazily
+    if (passive_expire(db, key)) return "";
+
     // Perform one step of migration if active
     if (db.rehash_idx != -1) db_rehash_step(db);
 
@@ -337,12 +401,24 @@ void execute_command(int fd, const vector<string>& cmd) {
     } 
     else if (command_name == "SET" && cmd.size() > 2) {
         db_set(g_db, cmd[1], cmd[2]);
+        
+        // Support optional EX argument: SET key value EX seconds
+        if (cmd.size() >= 5) {
+            string opt = cmd[3];
+            for (char &c : opt) c = toupper(c);
+            if (opt == "EX") {
+                try {
+                    uint64_t sec = stoull(cmd[4]);
+                    db_expire(g_db, cmd[1], sec);
+                } catch (...) {}
+            }
+        }
         response = "+OK\r\n"; // Simple String OK response
     } 
     else if (command_name == "GET" && cmd.size() > 1) {
         string value = db_get(g_db, cmd[1]);
         if (value.empty()) {
-            response = "$-1\r\n"; // Null Bulk String (key not found)
+            response = "$-1\r\n"; // Null Bulk String (key not found or expired)
         } else {
             response = "$" + to_string(value.length()) + "\r\n" + value + "\r\n";
         }
@@ -354,6 +430,19 @@ void execute_command(int fd, const vector<string>& cmd) {
         } else {
             response = ":0\r\n"; // Integer 0 (key not found)
         }
+    }
+    else if (command_name == "EXPIRE" && cmd.size() > 2) {
+        try {
+            uint64_t sec = stoull(cmd[2]);
+            bool ok = db_expire(g_db, cmd[1], sec);
+            response = ok ? ":1\r\n" : ":0\r\n";
+        } catch (...) {
+            response = "-ERR value is not an integer or out of range\r\n";
+        }
+    }
+    else if (command_name == "TTL" && cmd.size() > 1) {
+        int64_t ttl = db_ttl(g_db, cmd[1]);
+        response = ":" + to_string(ttl) + "\r\n";
     }
     else {
         response = "-ERR unknown command '" + cmd[0] + "'\r\n"; // Error response
