@@ -1,55 +1,69 @@
-#include <iostream>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <cstring>
-#include <cerrno>
-#include <cstdlib>
-#include <vector>
-#include <poll.h>
-#include <fcntl.h>
-#include <unordered_map>
-#include <chrono>
+// ==================================================================
+// SECTION 1: HEADER FILES (Zaroori Libraries Import Kar Rahe Hain)
+// ==================================================================
+#include <iostream>        // Console input/output ke liye (cout, cerr)
+#include <sys/socket.h>    // Networking socket operations ke liye (socket, bind, listen, accept)
+#include <netinet/in.h>    // IP address structures ke liye (sockaddr_in)
+#include <unistd.h>        // OS system calls ke liye (read, write, close)
+#include <cstring>       // String manipulation aur strerror error messages ke liye
+#include <cerrno>        // Global error variable (errno) ke liye
+#include <cstdlib>       // General utilities (exit, rand, calloc) ke liye
+#include <vector>        // Dynamic list array ke liye
+#include <poll.h>        // Event monitoring alert panel (poll) ke liye
+#include <fcntl.h>       // Non-blocking file control (fcntl) ke liye
+#include <unordered_map> // Key-value lookup map ke liye
+#include <chrono>        // High-precision time calculation ke liye
+#include <thread>        // Multithreading worker threads ke liye
+#include <mutex>         // Thread synchronization lock ke liye
+#include <condition_variable> // Worker threads wake-up signals ke liye
+#include <queue>         // Task queue ke liye
+#include <functional>    // std::function callbacks ke liye
 
 using namespace std;
 
-// Represents a connected client and their read buffer
+// ==================================================================
+// SECTION 2: CLIENT MAILBOX (Har Client Ka Network Buffer Track Karna)
+// ==================================================================
+// Jab koi client connect hota hai, uski browser/cli se aane waale raw bytes 
+// hum uske `read_buffer` (mailbox) me accumulate karte hain.
 struct Client {
-    int fd;
-    string read_buffer;
+    int fd;              // Client socket ka unique ID number
+    string read_buffer;  // Client ka raw network bytes mailbox
 };
 
-// --- DATABASE IN-MEMORY STORAGE STRUCTURES ---
+// ==================================================================
+// SECTION 3: IN-MEMORY DATABASE STRUCTURES (Custom Hash Table)
+// ==================================================================
 
-// A single key-value node in our hash table
+// Ek single key-value data box (Linked List node)
 struct Entry {
-    string key;
-    string value;
-    uint64_t expire_at = 0; // Expiration timestamp in ms (0 means no expiration)
-    Entry* next;            // Pointer to next entry if they hash to the same bucket (chaining)
+    string key;             // Ex: "name"
+    string value;           // Ex: "alex"
+    uint64_t expire_at = 0; // Expiration timestamp ms me (0 matlab no expiry)
+    Entry* next;            // Agla Entry node agar 2 keys ka hash same aa jaye (Chaining)
 };
 
-// Returns current Unix timestamp in milliseconds
+// Current exact Unix time milliseconds me calculate karne waala helper
 uint64_t current_time_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-// A single hash table
+// Ek akeli Hash Table structure
 struct HashTable {
-    Entry** table = nullptr; // Array of Entry pointers
-    size_t size = 0;         // Size of the array
-    size_t mask = 0;         // Size - 1 (used for fast bitwise modulo: hash & mask)
-    size_t num_keys = 0;     // Number of keys stored in this table
+    Entry** table = nullptr; // Entry pointers ka array (Buckets)
+    size_t size = 0;         // Table ki total storage size
+    size_t mask = 0;         // size - 1 (fast index calculate karne ke liye: hash & mask)
+    size_t num_keys = 0;     // Table me kitne keys abhi stored hain
 };
 
-// The main database containing two hash tables for incremental rehashing
+// Main Redis Database structure (isme 2 Hash Tables hain Incremental Rehashing ke liye)
 struct RedisDb {
-    HashTable ht[2];
-    int rehash_idx = -1; // If -1, we are not rehashing. If >= 0, it tracks our rehashing progress.
+    HashTable ht[2];     // ht[0] is primary table, ht[1] is secondary (used during resizing)
+    int rehash_idx = -1; // Agar -1 hai to rehashing band hai; >= 0 hai to rehashing active hai
 };
 
-// Standard FNV-1a 32-bit Hash Function (simple and highly efficient for strings)
+// Standard FNV-1a Hash Function (Text key ko ek numeric bucket index number me convert karta hai)
 uint32_t hash_function(const string& key) {
     uint32_t hash = 2166136261U;
     for (char c : key) {
@@ -140,7 +154,11 @@ Entry* ht_find(HashTable& ht, const string& key) {
 // Forward declaration of db_del for passive_expire
 bool db_del(RedisDb& db, const string& key);
 
-// Checks if a key is expired. If expired, deletes it lazily (Passive Expiration).
+// ==================================================================
+// SECTION 3B: EXPIRATION & TTL SYSTEM (Keys Ki Expiry Manage Karna)
+// ==================================================================
+
+// Passive Expiration: Jab koi key search hoti hai, tab check karta hai ki wo expire to nahi ho gayi
 bool passive_expire(RedisDb& db, const string& key) {
     Entry* entry = ht_find(db.ht[0], key);
     if (entry == nullptr && db.rehash_idx != -1) {
@@ -155,29 +173,29 @@ bool passive_expire(RedisDb& db, const string& key) {
     return false;
 }
 
-// Sets an expiration time in seconds for a key
+// Kisi key ke upar seconds ka expiration timer set karta hai
 bool db_expire(RedisDb& db, const string& key, uint64_t seconds) {
-    if (passive_expire(db, key)) return false; // Key already expired
+    if (passive_expire(db, key)) return false; // Key agar pehle hi expire ho chuki hai
 
     Entry* entry = ht_find(db.ht[0], key);
     if (entry == nullptr && db.rehash_idx != -1) {
         entry = ht_find(db.ht[1], key);
     }
-    if (entry == nullptr) return false; // Key does not exist
+    if (entry == nullptr) return false; // Key exist hi nahi karti
 
     entry->expire_at = current_time_ms() + (seconds * 1000);
     return true;
 }
 
-// Returns remaining TTL in seconds (-2 if non-existent, -1 if no expiration, >=0 if active)
+// Remaining TTL (Time-To-Live) seconds me return karta hai (-2: Not found, -1: No expiry, >=0: Seconds left)
 int64_t db_ttl(RedisDb& db, const string& key) {
-    if (passive_expire(db, key)) return -2; // Key expired/deleted
+    if (passive_expire(db, key)) return -2; // Key expire ho chuki hai
 
     Entry* entry = ht_find(db.ht[0], key);
     if (entry == nullptr && db.rehash_idx != -1) {
         entry = ht_find(db.ht[1], key);
     }
-    if (entry == nullptr) return -2; // Key does not exist
+    if (entry == nullptr) return -2; // Key nahi mili
 
     if (entry->expire_at == 0) return -1; // No expiration set
 
@@ -190,7 +208,7 @@ int64_t db_ttl(RedisDb& db, const string& key) {
     return (int64_t)((entry->expire_at - now) / 1000); // Remaining seconds
 }
 
-// Samples random keys and deletes expired ones periodically (Active Expiration Sweep)
+// Active Expiration: Background me 20 random keys check karke expired keys ko delete karta hai
 void active_expire_step(RedisDb& db) {
     if (db.ht[0].size == 0 || db.ht[0].num_keys == 0) return;
 
@@ -317,23 +335,22 @@ bool db_del(RedisDb& db, const string& key) {
     return deleted;
 }
 
-// Helper: reads a single line ending in \r\n from 'buf' starting at 'pos'.
-// If a line is successfully read, updates 'pos' and returns the line content (without \r\n).
-// If a complete line is not found, returns an empty string and leaves 'pos' unchanged.
+// ==================================================================
+// SECTION 4: RESP PARSER (Client Ki Redis Language Translate Karna)
+// ==================================================================
+
+// Helper: Network buffer me se \r\n tak ki 1 akeli line padhta hai
 string read_line(const string& buf, size_t& pos) {
     size_t newline = buf.find("\r\n", pos);
     if (newline == string::npos) {
-        return ""; // Incomplete line
+        return ""; // Line poori nahi aayi, wait karo
     }
     string line = buf.substr(pos, newline - pos);
-    pos = newline + 2; // Advance pos past \r\n
+    pos = newline + 2; // Next line par move karo
     return line;
 }
 
-// Attempts to parse a complete RESP command array from the buffer.
-// Returns 1 if a full command is parsed (and removes it from buf).
-// Returns 0 if the data is incomplete (needs more bytes).
-// Returns -1 if there is a protocol error.
+// Client ke mailbox (read_buffer) me se RESP command array decode karne waala translator
 int parse_request(string& buf, vector<string>& cmd) {
     if (buf.empty()) return 0;
     
@@ -406,10 +423,14 @@ void set_nonblocking(int fd) {
     }
 }
 
-// Our global in-memory database instance
+// Global in-memory database instance
 RedisDb g_db;
 
-// Executes a successfully parsed command list and sends back a RESP response
+// ==================================================================
+// SECTION 5: COMMAND EXECUTOR (Commands Ke Responses Build Karna)
+// ==================================================================
+// Translator se aaye parsed words (ex: ["SET", "name", "alex"]) ko execute 
+// karke client ko RESP format me reply bhejne waala function.
 void execute_command(int fd, const vector<string>& cmd) {
     if (cmd.empty()) return;
 
@@ -477,15 +498,75 @@ void execute_command(int fd, const vector<string>& cmd) {
         response = "-ERR unknown command '" + cmd[0] + "'\r\n"; // Error response
     }
 
-    if (write(fd, response.data(), response.length()) < 0) {
-        cerr << "Write failed on Client FD = " << fd << ": " << strerror(errno) << "\n";
-    }
-}
+// ==================================================================
+// SECTION 6: WORKER THREAD POOL (Background Worker Threads)
+// ==================================================================
+// Yeh class background worker threads ko manage karti hai taaki heavy background 
+// tasks parallel me execute ho sakein aur main server thread kabhi freeze na ho.
+class ThreadPool {
+public:
+    ThreadPool(size_t num_threads) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this]() {
+                while (true) {
+                    function<void()> task;
+                    {
+                        unique_lock<mutex> lock(this->queue_mutex);
+                        this->cv.wait(lock, [this]() {
+                            return this->stop || !this->tasks.empty();
+                        });
 
+                        if (this->stop && this->tasks.empty()) {
+                            return;
+                        }
+
+                        task = move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task(); // Execute the background task
+                }
+            });
+        }
+    }
+
+    void enqueue(function<void()> task) {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            tasks.push(task);
+        }
+        cv.notify_one(); // Wake up one sleeping worker thread
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        for (thread &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex queue_mutex;
+    condition_variable cv;
+    bool stop = false;
+};
+
+// ==================================================================
+// SECTION 7: MAIN EVENT LOOP (Networking & Event Demultiplexing)
+// ==================================================================
+// Program yahan se shuru hota hai. Yeh main thread server socket ko listen 
+// karta hai aur poll() alert panel ke jariye multiple clients ko handle karta hai.
 int main() {
-    // ==========================================
+    // ------------------------------------------
     // STEP 1: CREATE THE MAIN SERVER SOCKET
-    // ==========================================
+    // ------------------------------------------
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         die("Socket creation");
@@ -569,6 +650,11 @@ int main() {
 
                 // Register client in our state map
                 clients[client_fd] = Client{client_fd, ""};
+
+                // Offload a background analytics task to our worker thread pool!
+                g_pool.enqueue([client_fd]() {
+                    // Executed asynchronously in the background by a worker thread!
+                });
 
                 cout << "Client connected! Client FD = " << client_fd << "\n";
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
